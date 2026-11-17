@@ -22,6 +22,8 @@ static float gravity=9.80665f, prevA=0;
 static uint32_t prevT=0;
 static float onset=-1,peakA=0,peakG=0,peakJ=0;
 static int brakes=0,corrections=0;
+static uint32_t validTrials=0;
+static double meanPeakA=0,m2PeakA=0;
 static String quality="Ожидание измерений";
 static portMUX_TYPE mux=portMUX_INITIALIZER_UNLOCKED;
 static ImuPacket queue[64];
@@ -76,6 +78,12 @@ void imuMarkPress(uint32_t us){
         }
         previous=s.a;
     }
+    if(trialN>=10){
+        ++validTrials;
+        double delta=peakA-meanPeakA;
+        meanPeakA+=delta/validTrials;
+        m2PeakA+=delta*(peakA-meanPeakA);
+    }
     quality=trialN<10?"Недостаточно отсчётов": "Предварительная оценка: нет точной синхронизации и компенсации ориентации";
     trialId++;
 }
@@ -111,7 +119,7 @@ String imuTrialJson(){
              "\",\"metrics\":{\"onset_ms\":"+(onset<0?String("null"):String(onset,1))+
              ",\"peak_a\":"+String(peakA,2)+",\"peak_g\":"+String(peakG,1)+
              ",\"peak_j\":"+String(peakJ,1)+",\"brakes\":"+String(brakes)+
-             ",\"corrections\":"+String(corrections)+"},\"samples\":[";
+             ",\"corrections\":"+String(corrections)+",\"stability_sd\":"+(validTrials>1?String(sqrt(m2PeakA/(validTrials-1)),2):String("null"))+",\"stability_n\":"+String(validTrials)+"},\"samples\":[";
     // Limit JSON payload and RAM use; plot uses up to 200 decimated samples.
     size_t step=trialN>200?(trialN+199)/200:1;
     for(size_t i=0;i<trialN;i+=step){
