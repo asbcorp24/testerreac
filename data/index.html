@@ -49,6 +49,21 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;bord
 <p id="message">Готово к работе</p>
 </section>
 <section class="panel">
+<h2>Соревнование — 1–4 участника</h2>
+<p class="muted">Участники проходят одинаковые задания по очереди на одних и тех же девяти кубах. Побеждает большее число правильных ответов, затем меньшее суммарное время.</p>
+<div class="settings">
+<label>Количество участников<select id="players"><option>1</option><option>2</option><option>3</option><option selected>4</option></select></label>
+<label>Заданий на участника<input type="number" id="rounds" min="1" max="30" value="9"></label>
+<label>Имя 1<input id="name1" value="Игрок 1" maxlength="24"></label>
+<label>Имя 2<input id="name2" value="Игрок 2" maxlength="24"></label>
+<label>Имя 3<input id="name3" value="Игрок 3" maxlength="24"></label>
+<label>Имя 4<input id="name4" value="Игрок 4" maxlength="24"></label>
+</div>
+<div class="actions"><button id="compStart">Начать соревнование</button><button id="compNext" class="secondary" disabled>Следующий участник</button></div>
+<p id="compInfo" class="muted">Ожидание старта</p>
+<div class="scroll"><table><thead><tr><th>Место</th><th>Участник</th><th>Верно</th><th>Ошибки</th><th>Сумма времени</th></tr></thead><tbody id="scores"></tbody></table></div>
+</section>
+<section class="panel">
 <h2>Мишени</h2>
 <p class="muted">Нажатия регистрируются физическими кнопками. Подсвеченная мишень — номер текущего задания.</p>
 <div id="grid" class="grid"></div>
@@ -66,7 +81,22 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;bord
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let receivedSeq=0, correct=0, index=0, currentlyActive=false;
+let receivedSeq=0, correct=0, index=0, currentlyActive=false, names=['Игрок 1','Игрок 2','Игрок 3','Игрок 4'];
+$('compStart').onclick=async()=>{
+ try {
+  names=[1,2,3,4].map(i=>$('name'+i).value.trim()||'Игрок '+i);
+  const params={players:$('players').value,rounds:$('rounds').value,source:$('source').value};
+  names.forEach((n,i)=>params['name'+(i+1)]=n);
+  await api('/api/competition/start',params);
+  correct=0;index=0;$('history').textContent='';$('correct').textContent='0';$('time').textContent='—';
+  message('Соревнование началось');$('compInfo').textContent='Первый участник: '+names[0];
+ }catch(e){message(e.message);}
+};
+$('compNext').onclick=async()=>{
+ try {await api('/api/competition/next',{});message('Следующий участник готовится');}
+ catch(e){message(e.message);}
+};
+
 function draw(target) {
   $('grid').innerHTML='';
   for(let n=1;n<=9;n++){
@@ -100,6 +130,21 @@ async function update() {
   try {
     const [state,evt]=await Promise.all([api('/api/status'),api('/api/event')]);
     $('progress').textContent=state.completed+' / '+state.goal;
+    $('compNext').disabled=!state.awaiting_next;
+    if(state.competition){
+      const label=names[(state.player||1)-1]||('Игрок '+state.player);
+      $('compInfo').textContent=state.awaiting_next?'Очередь следующего участника — нажмите кнопку':state.active?'Выступает: '+label: 'Соревнование завершено';
+      const board=await api('/api/competition/scores');
+      const sorted=board.scores.slice().sort((a,b)=>b.correct-a.correct||a.sum_ms-b.sum_ms||a.player-b.player);
+      $('scores').textContent='';
+      sorted.forEach((s,i)=>{
+        const tr=document.createElement('tr');
+        [String(i+1),names[s.player-1]||('Игрок '+s.player),String(s.correct),String(s.errors),String(s.sum_ms)+' мс'].forEach(x=>{
+          const td=document.createElement('td');td.textContent=x;tr.appendChild(td);
+        });
+        $('scores').appendChild(tr);
+      });
+    }
     draw(state.target);
     if(evt.seq && evt.seq!==receivedSeq){
       receivedSeq=evt.seq;
@@ -110,7 +155,7 @@ async function update() {
         const time=evt.elapsed_ms>=0?evt.elapsed_ms.toFixed(1)+' мс':'—';
         $('time').textContent=time;
         const tr=document.createElement('tr');
-        for(const x of [String(index),String(evt.target),evt.pressed?String(evt.pressed):'—',time,evt.type==='timeout'?'Тайм-аут':evt.correct?'Верно':'Ошибка']){
+        for(const x of [evt.player?names[evt.player-1]||String(evt.player):String(index),String(evt.target),evt.pressed?String(evt.pressed):'—',time,evt.type==='timeout'?'Тайм-аут':evt.correct?'Верно':'Ошибка']){
           const td=document.createElement('td');td.textContent=x;tr.appendChild(td);
         }
         $('history').prepend(tr);
