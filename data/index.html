@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reaction Trainer</title>
+<style>
+:root{font-family:system-ui,Arial,sans-serif;color-scheme:dark}
+*{box-sizing:border-box}
+body{background:#0b1220;color:#edf3fc;margin:0;padding:20px}
+main{max-width:920px;margin:auto}
+h1{margin:0 0 6px;font-size:32px}
+.muted{color:#a1b2c8}
+.panel{background:#172338;border:1px solid #304159;border-radius:16px;padding:18px;margin:16px 0}
+.settings{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+label{display:flex;flex-direction:column;gap:6px}
+select,input,button{font:inherit;padding:12px;border:1px solid #53637b;border-radius:10px}
+select,input{background:#0c1729;color:#fff;width:100%}
+button{background:#4daaff;color:#051322;border:0;cursor:pointer;font-weight:700}
+button.secondary{background:#344762;color:#fff}
+.actions{display:flex;gap:12px;margin-top:14px;flex-wrap:wrap}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;max-width:550px;margin:16px auto}
+.cube{background:#273851;border:2px solid #455a79;border-radius:14px;min-height:95px;display:flex;justify-content:center;align-items:center;font-size:34px;font-weight:800}
+.cube.active{background:#166534;border-color:#86efac;box-shadow:0 0 22px #22c55e50}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.metric{background:#111c2e;border-radius:10px;padding:14px;text-align:center}
+.metric strong{display:block;font-size:23px}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #31445c}
+.scroll{overflow-x:auto}
+#message{font-size:19px;font-weight:650;min-height:28px}
+@media(max-width:530px){.settings{grid-template-columns:1fr}.cube{min-height:73px}.metrics{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body><main>
+<h1>Reaction Trainer</h1>
+<p class="muted">ESP32-WROOM-32 · 9 проводных кубов · DFPlayer Mini</p>
+<section class="panel">
+<div class="settings">
+<label>Режим
+<select id="mode"><option value="random">Случайный</option><option value="sequence">По порядку 1–9</option><option value="single">Один куб</option></select></label>
+<label>Сигнал
+<select id="source"><option value="screen">На экране</option><option value="audio">Голос через DFPlayer</option></select></label>
+<label>Количество попыток
+<input type="number" id="count" min="1" max="100" value="9"></label>
+<label>Номер куба (для одиночного режима)
+<input type="number" id="target" min="1" max="9" value="1"></label>
+</div>
+<div class="actions"><button id="start">Начать тестирование</button><button class="secondary" id="stop">Остановить</button></div>
+<p id="message">Готово к работе</p>
+</section>
+<section class="panel">
+<h2>Мишени</h2>
+<p class="muted">Нажатия регистрируются физическими кнопками. Подсвеченная мишень — номер текущего задания.</p>
+<div id="grid" class="grid"></div>
+<div class="metrics">
+<div class="metric">Попыток<strong id="progress">0 / 0</strong></div>
+<div class="metric">Последний результат<strong id="time">—</strong></div>
+<div class="metric">Правильных<strong id="correct">0</strong></div>
+</div>
+</section>
+<section class="panel"><h2>Результаты</h2><div class="scroll">
+<table><thead><tr><th>№</th><th>Цель</th><th>Нажат</th><th>Время</th><th>Итог</th></tr></thead>
+<tbody id="history"></tbody></table></div>
+<p class="muted">Результаты пока хранятся в браузере только на время открытой страницы. Временные показатели предварительные: задержки экрана и DFPlayer не откалиброваны.</p>
+</section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let receivedSeq=0, correct=0, index=0, currentlyActive=false;
+function draw(target) {
+  $('grid').innerHTML='';
+  for(let n=1;n<=9;n++){
+    const el=document.createElement('div');
+    el.className='cube'+(target===n?' active':'');
+    el.textContent=n;
+    $('grid').appendChild(el);
+  }
+}
+function message(t){$('message').textContent=t;}
+async function api(path, params) {
+  const opts=params?{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(params)}:{};
+  const resp=await fetch(path,opts);
+  const data=await resp.json();
+  if(!resp.ok)throw Error(data.error||'HTTP '+resp.status);
+  return data;
+}
+$('start').onclick=async()=>{
+  try {
+    const form={mode:$('mode').value,source:$('source').value,count:$('count').value,target:$('target').value};
+    await api('/api/start',form);
+    correct=0;index=0;$('history').textContent='';$('correct').textContent='0';$('time').textContent='—';
+    message('Подготовка к сигналу…');
+  }catch(e){message(e.message);}
+};
+$('stop').onclick=async()=>{
+  try {await api('/api/stop',{});draw(0);message('Остановлено');}
+  catch(e){message(e.message);}
+};
+async function update() {
+  try {
+    const [state,evt]=await Promise.all([api('/api/status'),api('/api/event')]);
+    $('progress').textContent=state.completed+' / '+state.goal;
+    draw(state.target);
+    if(evt.seq && evt.seq!==receivedSeq){
+      receivedSeq=evt.seq;
+      if(evt.type==='press'||evt.type==='timeout'){
+        index++;
+        if(evt.correct)correct++;
+        $('correct').textContent=String(correct);
+        const time=evt.elapsed_ms>=0?evt.elapsed_ms.toFixed(1)+' мс':'—';
+        $('time').textContent=time;
+        const tr=document.createElement('tr');
+        for(const x of [String(index),String(evt.target),evt.pressed?String(evt.pressed):'—',time,evt.type==='timeout'?'Тайм-аут':evt.correct?'Верно':'Ошибка']){
+          const td=document.createElement('td');td.textContent=x;tr.appendChild(td);
+        }
+        $('history').prepend(tr);
+        message(evt.type==='timeout'?'Время вышло':evt.correct?'Верно':'Неверный куб');
+      }
+    }
+    if(state.active && state.waiting){
+      message(state.source==='screen'?'Нажмите куб № '+state.target:'Слушайте голосовую команду');
+    }else if(state.active && !state.waiting){
+      message('Приготовьтесь…');
+    }else if(currentlyActive && !state.active){
+      message('Серия завершена');
+    }
+    currentlyActive=state.active;
+  }catch(e){message('Связь с ESP32 потеряна: '+e.message);}
+}
+draw(0);update();setInterval(update,120);
+</script></body></html>
