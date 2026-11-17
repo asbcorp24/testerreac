@@ -68,6 +68,11 @@ static void receive(const uint8_t* mac,const uint8_t* data,int len) {
 void imuReceiverBegin(){
     if(esp_now_init()!=ESP_OK){Serial.println("ESP-NOW init failed");return;}
     esp_now_register_recv_cb(receive);
+    esp_now_peer_info_t peer={};
+    memset(peer.peer_addr,0xFF,6);
+    peer.channel=1;
+    peer.encrypt=false;
+    if(esp_now_add_peer(&peer)!=ESP_OK)Serial.println("ESP-NOW broadcast peer failed");
 }
 void imuMarkCue(uint32_t us){
     cueLocal=us;
