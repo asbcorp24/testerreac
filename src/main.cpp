@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <HardwareSerial.h>
 #include "config.h"
+#include "imu_receiver.h"
 
 // MVP: button timestamps are captured in the foreground loop.
 // For validated sub-millisecond timing use GPIO interrupts and calibrate cue onset.
@@ -84,6 +85,7 @@ void scheduleNext() {
 void issueCue() {
     // This is command dispatch time, NOT verified loudspeaker/screen onset.
     cueUs = micros();
+    imuMarkCue(cueUs);
     if (source == "audio") dfCommand(0x12, target); // /MP3/0001.mp3 ... 0009.mp3
     stage = Stage::Waiting;
     stageAtMs = millis();
@@ -95,6 +97,7 @@ void finishTrial(uint8_t pressed, uint32_t pressUs, bool timedOut) {
     float elapsed = timedOut ? -1.0f :
                               static_cast<uint32_t>(pressUs - cueUs) / 1000.0f;
     bool correct = !timedOut && pressed == expected;
+    imuMarkPress(timedOut ? micros() : pressUs);
     ++completed;
     ++eventSequence;
     if (competition) {
@@ -312,12 +315,15 @@ void setup() {
     if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed");
     WiFi.mode(WIFI_AP);
     WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+    imuReceiverBegin();
     randomSeed(esp_random());
 
     web.on("/", HTTP_GET, serveIndex);
     web.on("/api/status", HTTP_GET, handleStatus);
     web.on("/api/event", HTTP_GET, []() { json(lastEvent); });
     web.on("/api/start", HTTP_POST, handleStart);
+    web.on("/api/imu", HTTP_GET, []() { json(imuStatusJson()); });
+    web.on("/api/imu/trial", HTTP_GET, []() { json(imuTrialJson()); });
     web.on("/api/competition/start", HTTP_POST, handleCompetitionStart);
     web.on("/api/competition/next", HTTP_POST, handleCompetitionNext);
     web.on("/api/competition/scores", HTTP_GET, handleCompetitionScores);
@@ -334,6 +340,7 @@ void setup() {
 }
 
 void loop() {
+    imuReceiverPoll();
     scanButtons();
     tickSession();
     web.handleClient();

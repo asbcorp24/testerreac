@@ -73,6 +73,22 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;bord
 <div class="metric">Правильных<strong id="correct">0</strong></div>
 </div>
 </section>
+<section class="panel">
+<h2>Анализ движения руки (IMU)</h2>
+<p class="muted" id="imuLink">Ожидание беспроводного датчика…</p>
+<div class="metrics">
+<div class="metric">Начало движения<strong id="imuOnset">—</strong></div>
+<div class="metric">Пиковое ускорение<strong id="imuPeak">—</strong></div>
+<div class="metric">Пиковая угловая скорость<strong id="imuGyro">—</strong></div>
+<div class="metric">Пиковый рывок<strong id="imuJerk">—</strong></div>
+<div class="metric">Торможения<strong id="imuBrake">—</strong></div>
+<div class="metric">Коррекции<strong id="imuCorrections">—</strong></div>
+</div>
+<p class="muted" id="imuQuality">Для анализа нужна синхронизация и достаточное число отсчётов.</p>
+<canvas id="imuGraph" style="width:100%;height:270px;background:#0c1729;border-radius:12px" width="850" height="270"></canvas>
+<p class="muted">Синий — модуль линейного ускорения (м/с²), оранжевый — модуль угловой скорости (°/с), зелёный — рывок (м/с³, масштабируется отдельно). Предварительные эвристики, не медицинская оценка.</p>
+<button class="secondary" id="imuExport">Экспорт CSV последнего движения</button>
+</section>
 <section class="panel"><h2>Результаты</h2><div class="scroll">
 <table><thead><tr><th>№</th><th>Цель</th><th>Нажат</th><th>Время</th><th>Итог</th></tr></thead>
 <tbody id="history"></tbody></table></div>
@@ -172,5 +188,44 @@ async function update() {
     currentlyActive=state.active;
   }catch(e){message('Связь с ESP32 потеряна: '+e.message);}
 }
-draw(0);update();setInterval(update,120);
+let imuLast=null,imuTrialId=-1;
+function plotImu(samples){
+ const c=$('imuGraph'),ctx=c.getContext('2d'),w=c.width,h=c.height;
+ ctx.clearRect(0,0,w,h);
+ ctx.strokeStyle='#334155';ctx.lineWidth=1;
+ for(let i=1;i<5;i++){ctx.beginPath();ctx.moveTo(35,i*h/5);ctx.lineTo(w-10,i*h/5);ctx.stroke();}
+ if(!samples||samples.length<2)return;
+ const keys=[['a','#60a5fa'],['g','#fb923c'],['j','#4ade80']];
+ const ts=samples.map(x=>x.t),lo=Math.min(...ts),hi=Math.max(...ts);
+ keys.forEach(([key,color])=>{
+  const max=Math.max(1,...samples.map(x=>x[key]));
+  ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
+  samples.forEach((p,i)=>{
+   const x=35+(p.t-lo)/Math.max(1,hi-lo)*(w-50),y=h-18-p[key]/max*(h-35);
+   if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+  });ctx.stroke();
+ });
+}
+$('imuExport').onclick=()=>{
+ if(!imuLast||!imuLast.samples||!imuLast.samples.length)return;
+ const rows=['t_ms,accel_ms2,gyro_dps,jerk_ms3',...imuLast.samples.map(p=>[p.t,p.a,p.g,p.j].join(','))];
+ const blob=new Blob([rows.join('\n')],{type:'text/csv;charset=utf-8'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='imu-trial.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+};
+async function updateImu(){
+ try{
+  const [state,trial]=await Promise.all([api('/api/imu'),api('/api/imu/trial')]);
+  $('imuLink').textContent=state.connected?'Датчик подключён · возраст пакета '+state.age_ms+' мс · потери '+state.lost+' · частота '+state.hz+' Гц':'Датчик не подключён';
+  if(trial.id===imuTrialId)return;
+  imuTrialId=trial.id;imuLast=trial;
+  const m=trial.metrics||{};
+  const show=(id,v,unit)=>$(id).textContent=v===null||v===undefined?'—':Number(v).toFixed(1)+' '+unit;
+  show('imuOnset',m.onset_ms,'мс');show('imuPeak',m.peak_a,'м/с²');
+  show('imuGyro',m.peak_g,'°/с');show('imuJerk',m.peak_j,'м/с³');
+  show('imuBrake',m.brakes,'');show('imuCorrections',m.corrections,'');
+  $('imuQuality').textContent=trial.quality||'Нет данных';
+  plotImu(trial.samples);
+ }catch(e){$('imuLink').textContent='Ошибка IMU: '+e.message;}
+}
+draw(0);update();updateImu();setInterval(update,120);setInterval(updateImu,600);
 </script></body></html>
