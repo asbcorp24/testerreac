@@ -11,11 +11,24 @@ struct __attribute__((packed)) ImuPacket {
     int16_t ax, ay, az, gx, gy, gz;
 };
 static constexpr uint32_t MAGIC = 0x52494D55;
+static constexpr uint32_t SYNC_MAGIC = 0x53594E43;
+struct __attribute__((packed)) SyncPacket {uint32_t magic,nonce,t0,t1,t2;};
+static uint8_t peerMac[6]={};
+static bool peerKnown=false;
+static uint32_t syncNonce=0,syncT0=0,nextSyncMs=0;
+static int32_t clockOffsetUs=0; // sensor clock minus central clock
+static uint32_t bestRttUs=UINT32_MAX,lastSyncMs=0;
+static volatile bool syncReplyPending=false;
+static SyncPacket syncReply={};
+static constexpr uint32_t MAX_SYNC_RTT_US=20000;
+
 static constexpr size_t RING = 400;
 struct Sample { uint32_t t; float a,g,j; };
 static Sample ring[RING], trial[RING];
 static size_t head=0, used=0, trialN=0;
 static uint32_t cueLocal=0, pressLocal=0, cueSensor=0, trialId=0;
+static bool trialSyncValid=false;
+static uint32_t trialSyncRtt=0;
 static uint32_t lastPacketMs=0,lastSeq=0,lost=0, lastSensorUs=0;
 static bool synced=false,haveSeq=false,havePrev=false;
 static float gravity=9.80665f, prevA=0;
@@ -31,12 +44,22 @@ static volatile uint8_t wr=0,rd=0;
 static volatile uint32_t dropped=0;
 
 // ESP-NOW callback runs outside loop. Never do JSON/float work in callback.
-static void receive(const uint8_t*,const uint8_t* data,int len) {
+static void receive(const uint8_t* mac,const uint8_t* data,int len) {
+    if(len==sizeof(SyncPacket)){
+        SyncPacket p;memcpy(&p,data,sizeof(p));
+        if(p.magic==SYNC_MAGIC && p.nonce==syncNonce){
+            portENTER_CRITICAL(&mux);
+            if(!syncReplyPending){syncReply=p;syncReplyPending=true;}
+            portEXIT_CRITICAL(&mux);
+        }
+        return;
+    }
     if(len!=sizeof(ImuPacket))return;
     ImuPacket p;
     memcpy(&p,data,sizeof(p));
     if(p.magic!=MAGIC)return;
     portENTER_CRITICAL(&mux);
+    memcpy(peerMac,mac,6);peerKnown=true;
     uint8_t next=static_cast<uint8_t>((wr+1)%64);
     if(next!=rd){queue[wr]=p;wr=next;}
     else dropped++;
@@ -48,18 +71,20 @@ void imuReceiverBegin(){
 }
 void imuMarkCue(uint32_t us){
     cueLocal=us;
-    cueSensor=lastSensorUs; // coarse alignment from latest received packet
-    synced=lastPacketMs && millis()-lastPacketMs<300;
+    trialSyncValid=lastSyncMs && millis()-lastSyncMs<5000 && bestRttUs<MAX_SYNC_RTT_US;
+    trialSyncRtt=bestRttUs;
+    cueSensor=static_cast<uint32_t>(static_cast<int64_t>(us)+clockOffsetUs);
+    synced=trialSyncValid && lastPacketMs && millis()-lastPacketMs<300;
     trialN=0;
 }
 void imuMarkPress(uint32_t us){
     pressLocal=us;
     trialN=0;onset=-1;peakA=peakG=peakJ=0;brakes=corrections=0;
     if(!synced || millis()-lastPacketMs>300){quality="Нет синхронизированных данных IMU";trialId++;return;}
-    // Time alignment is approximate: last received sample at cue, network delay uncalibrated.
+    // Align sensor timestamps to central cue via midpoint RTT clock estimate.
     uint32_t duration=static_cast<uint32_t>(pressLocal-cueLocal);
     size_t start=(head+RING-used)%RING;
-    bool moving=false;int lowCount=0;int peakCount=0;
+    bool moving=false;int lowCount=0;
     float previous=0;
     for(size_t i=0;i<used;i++){
         Sample s=ring[(start+i)%RING];
@@ -84,10 +109,41 @@ void imuMarkPress(uint32_t us){
         meanPeakA+=delta/validTrials;
         m2PeakA+=delta*(peakA-meanPeakA);
     }
-    quality=trialN<10?"Недостаточно отсчётов": "Предварительная оценка: нет точной синхронизации и компенсации ориентации";
+    quality=trialN<10?"Недостаточно отсчётов": "Синхронизация оценена по RTT; начало стимула и ориентация IMU не откалиброваны";
     trialId++;
 }
 void imuReceiverPoll(){
+    // Process completed exchange in loop, not Wi-Fi callback.
+    SyncPacket reply={};bool got=false;
+    portENTER_CRITICAL(&mux);
+    if(syncReplyPending){reply=syncReply;syncReplyPending=false;got=true;}
+    portEXIT_CRITICAL(&mux);
+    if(got && reply.nonce==syncNonce && reply.t0==syncT0){
+        uint32_t t3=micros();
+        uint32_t roundtrip=static_cast<uint32_t>(t3-reply.t0);
+        uint32_t remoteProcessing=static_cast<uint32_t>(reply.t2-reply.t1);
+        if(roundtrip>=remoteProcessing){
+            uint32_t rtt=roundtrip-remoteProcessing;
+            // Signed 32-bit deltas are valid for intervals shorter than ~35 min.
+            int32_t offset=(static_cast<int32_t>(reply.t1-reply.t0)+
+                            static_cast<int32_t>(reply.t2-t3))/2;
+            if(rtt<MAX_SYNC_RTT_US){
+                if(!lastSyncMs || millis()-lastSyncMs>5000 || rtt<=bestRttUs+1000){
+                    clockOffsetUs=offset;
+                    bestRttUs=rtt;
+                }
+                lastSyncMs=millis();
+            }
+        }
+    }
+    if(peerKnown && static_cast<int32_t>(millis()-nextSyncMs)>=0){
+        nextSyncMs=millis()+500;
+        SyncPacket req={};req.magic=SYNC_MAGIC;req.nonce=++syncNonce;
+        req.t0=micros();syncT0=req.t0;
+        // Broadcast works without registering an individual peer.
+        const uint8_t broadcast[6]={255,255,255,255,255,255};
+        esp_now_send(broadcast,reinterpret_cast<const uint8_t*>(&req),sizeof(req));
+    }
     for(int n=0;n<40;n++){
         ImuPacket p;
         portENTER_CRITICAL(&mux);
@@ -112,10 +168,13 @@ String imuStatusJson(){
     uint32_t age=lastPacketMs?millis()-lastPacketMs:999999;
     return "{\"connected\":"+String(age<1000?"true":"false")+
            ",\"age_ms\":"+String(age)+",\"lost\":"+String(lost+dropped)+
-           ",\"hz\":200}";
+           ",\"hz\":200,\"sync_valid\":"+String(lastSyncMs && millis()-lastSyncMs<5000?"true":"false")+
+           ",\"sync_rtt_us\":"+(lastSyncMs?String(bestRttUs):String("null"))+"}";
 }
 String imuTrialJson(){
-    String s="{\"id\":"+String(trialId)+",\"quality\":\""+quality+
+    String s="{\"id\":"+String(trialId)+
+             ",\"sync_valid\":"+String(trialSyncValid?"true":"false")+
+             ",\"sync_rtt_us\":"+(trialSyncValid?String(trialSyncRtt):String("null"))+",\"quality\":\""+quality+
              "\",\"metrics\":{\"onset_ms\":"+(onset<0?String("null"):String(onset,1))+
              ",\"peak_a\":"+String(peakA,2)+",\"peak_g\":"+String(peakG,1)+
              ",\"peak_j\":"+String(peakJ,1)+",\"brakes\":"+String(brakes)+
