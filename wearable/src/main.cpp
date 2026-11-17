@@ -9,6 +9,20 @@
 static constexpr int SDA_PIN=4,SCL_PIN=5;
 static constexpr uint8_t MPU=0x68;
 static constexpr uint32_t MAGIC=0x52494D55;
+static constexpr uint32_t SYNC_MAGIC=0x53594E43;
+struct __attribute__((packed)) SyncPacket {uint32_t magic,nonce,t0,t1,t2;};
+static volatile bool syncWaiting=false;
+static SyncPacket incomingSync={};
+static portMUX_TYPE syncMux=portMUX_INITIALIZER_UNLOCKED;
+static void onReceive(const uint8_t*,const uint8_t* data,int len){
+    if(len!=sizeof(SyncPacket))return;
+    SyncPacket req;memcpy(&req,data,sizeof(req));
+    if(req.magic!=SYNC_MAGIC)return;
+    req.t1=micros();
+    portENTER_CRITICAL(&syncMux);
+    incomingSync=req;syncWaiting=true;
+    portEXIT_CRITICAL(&syncMux);
+}
 struct __attribute__((packed)) ImuPacket {
     uint32_t magic,seq,tUs;
     int16_t ax,ay,az,gx,gy,gz;
@@ -43,9 +57,18 @@ void setup(){
     esp_now_peer_info_t peer={};
     memcpy(peer.peer_addr,broadcast,6);peer.channel=1;peer.encrypt=false;
     esp_now_add_peer(&peer);
+    esp_now_register_recv_cb(onReceive);
     nextUs=micros();
 }
 void loop(){
+    SyncPacket reply={};bool pending=false;
+    portENTER_CRITICAL(&syncMux);
+    if(syncWaiting){reply=incomingSync;syncWaiting=false;pending=true;}
+    portEXIT_CRITICAL(&syncMux);
+    if(pending){
+        reply.t2=micros();
+        esp_now_send(broadcast,reinterpret_cast<const uint8_t*>(&reply),sizeof(reply));
+    }
     if((int32_t)(micros()-nextUs)<0)return;
     nextUs+=5000; // 200 Hz
     ImuPacket p={};p.magic=MAGIC;p.seq=seq++;p.tUs=micros();
