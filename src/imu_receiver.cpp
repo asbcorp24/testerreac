@@ -22,16 +22,21 @@ static volatile bool syncReplyPending=false;
 static SyncPacket syncReply={};
 static constexpr uint32_t MAX_SYNC_RTT_US=20000;
 
-static constexpr size_t RING = 400;
+static constexpr size_t RING = 2400; // 12 s at 200 Hz, covers 10 s timeout plus margins
+static constexpr uint32_t POST_US = 150000; // 150 ms after physical press
+static constexpr float GRAVITY_TAU_S = 0.65f;
 struct Sample { uint32_t t; float a,g,j; };
 static Sample ring[RING], trial[RING];
 static size_t head=0, used=0, trialN=0;
 static uint32_t cueLocal=0, pressLocal=0, cueSensor=0, trialId=0;
+static uint32_t pressSensor=0;
+static bool capturePending=false;
 static bool trialSyncValid=false;
 static uint32_t trialSyncRtt=0;
 static uint32_t lastPacketMs=0,lastSeq=0,lost=0, lastSensorUs=0;
 static bool synced=false,haveSeq=false,havePrev=false;
-static float gravity=9.80665f, prevA=0;
+static float gravX=0,gravY=0,gravZ=0;
+static float prevAx=0,prevAy=0,prevAz=0;
 static uint32_t prevT=0;
 static float onset=-1,peakA=0,peakG=0,peakJ=0;
 static int brakes=0,corrections=0;
@@ -81,12 +86,24 @@ void imuMarkCue(uint32_t us){
     cueSensor=static_cast<uint32_t>(static_cast<int64_t>(us)+clockOffsetUs);
     synced=trialSyncValid && lastPacketMs && millis()-lastPacketMs<300;
     trialN=0;
+    capturePending=false;
 }
+static void finalizeCapture();
 void imuMarkPress(uint32_t us){
     pressLocal=us;
+    pressSensor=static_cast<uint32_t>(static_cast<int64_t>(us)+clockOffsetUs);
     trialN=0;onset=-1;peakA=peakG=peakJ=0;brakes=corrections=0;
-    if(!synced || millis()-lastPacketMs>300){quality="Нет синхронизированных данных IMU";trialId++;return;}
-    // Align sensor timestamps to central cue via midpoint RTT clock estimate.
+    if(!synced || millis()-lastPacketMs>300){
+        quality="Нет синхронизированных данных IMU";
+        trialId++;
+        capturePending=false;
+        return;
+    }
+    // Do not finalize until the post-contact samples have arrived.
+    capturePending=true;
+}
+static void finalizeCapture(){
+    capturePending=false;
     uint32_t duration=static_cast<uint32_t>(pressLocal-cueLocal);
     size_t start=(head+RING-used)%RING;
     bool moving=false;int lowCount=0;
@@ -94,15 +111,18 @@ void imuMarkPress(uint32_t us){
     for(size_t i=0;i<used;i++){
         Sample s=ring[(start+i)%RING];
         int32_t dt=static_cast<int32_t>(s.t-cueSensor);
-        if(dt<0 || static_cast<uint32_t>(dt)>duration+80000)continue;
+        if(dt<0 || static_cast<uint32_t>(dt)>duration+POST_US)continue;
+        // Retain samples from cue through 150 ms after button press.
         s.t=static_cast<uint32_t>(dt)/1000;
         if(trialN<RING)trial[trialN++]=s;
+        // Metrics use ONLY samples up to physical contact.
+        if(static_cast<uint32_t>(dt)>duration)continue;
         peakA=fmaxf(peakA,s.a);peakG=fmaxf(peakG,s.g);peakJ=fmaxf(peakJ,s.j);
         bool active=s.a>1.2f || s.g>35.0f;
         if(active && onset<0)onset=s.t;
         if(onset>=0){
             if(s.a<previous-0.8f && previous>2.0f)brakes++;
-            if(!active){lowCount++;}
+            if(!active)lowCount++;
             else if(lowCount>=3 && moving){corrections++;lowCount=0;}
             if(active)moving=true;
         }
@@ -114,7 +134,8 @@ void imuMarkPress(uint32_t us){
         meanPeakA+=delta/validTrials;
         m2PeakA+=delta*(peakA-meanPeakA);
     }
-    quality=trialN<10?"Недостаточно отсчётов": "Синхронизация оценена по RTT; начало стимула и ориентация IMU не откалиброваны";
+    quality=trialN<10?"Недостаточно отсчётов":
+        "Векторная фильтрация гравитации; синхронизация оценена по RTT, требуется калибровка";
     trialId++;
 }
 void imuReceiverPoll(){
@@ -159,14 +180,30 @@ void imuReceiverPoll(){
         if(haveSeq && p.seq>lastSeq+1)lost+=p.seq-lastSeq-1;
         haveSeq=true;lastSeq=p.seq;lastPacketMs=millis();lastSensorUs=p.tUs;
         float ax=p.ax/16384.0f*9.80665f,ay=p.ay/16384.0f*9.80665f,az=p.az/16384.0f*9.80665f;
-        float magnitude=sqrtf(ax*ax+ay*ay+az*az);
-        // Simple magnitude residual; not orientation-corrected linear acceleration.
-        float a=fabsf(magnitude-gravity);
         float g=sqrtf(float(p.gx)*p.gx+float(p.gy)*p.gy+float(p.gz)*p.gz)/131.0f;
-        float j=havePrev?fabsf(a-prevA)/(static_cast<uint32_t>(p.tUs-prevT)*1e-6f+1e-6f):0;
-        if(j>500)j=500; // clip extreme packet jitter
+        float dt=havePrev?static_cast<uint32_t>(p.tUs-prevT)*1e-6f:0.005f;
+        if(dt<=0 || dt>0.2f){dt=0.005f;havePrev=false;}
+        // First-order low-pass gravity estimate in sensor coordinates.
+        // Fast wrist rotation can still bias this estimate: not full AHRS.
+        float alpha=dt/(GRAVITY_TAU_S+dt);
+        if(!havePrev){gravX=ax;gravY=ay;gravZ=az;}
+        gravX+=alpha*(ax-gravX);gravY+=alpha*(ay-gravY);gravZ+=alpha*(az-gravZ);
+        float lx=ax-gravX,ly=ay-gravY,lz=az-gravZ;
+        float a=sqrtf(lx*lx+ly*ly+lz*lz);
+        float j=havePrev?sqrtf((lx-prevAx)*(lx-prevAx)+(ly-prevAy)*(ly-prevAy)+
+                               (lz-prevAz)*(lz-prevAz))/dt:0;
+        if(j>500)j=500; // cap artifacts from noise or lost packets
         ring[head]={p.tUs,a,g,j};head=(head+1)%RING;if(used<RING)used++;
-        prevA=a;prevT=p.tUs;havePrev=true;
+        prevAx=lx;prevAy=ly;prevAz=lz;prevT=p.tUs;havePrev=true;
+    }
+    if(capturePending){
+        // Complete after the sample timeline reaches contact + 150 ms.
+        // If radio traffic stops, end after 500 ms to avoid a stuck capture.
+        uint32_t required=pressSensor+POST_US;
+        if((int32_t)(lastSensorUs-required)>=0 ||
+           static_cast<uint32_t>(micros()-pressLocal)>500000){
+            finalizeCapture();
+        }
     }
 }
 String imuStatusJson(){
