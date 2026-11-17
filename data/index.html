@@ -82,7 +82,7 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;bord
 <div class="metric">Пиковая угловая скорость<strong id="imuGyro">—</strong></div>
 <div class="metric">Пиковый рывок<strong id="imuJerk">—</strong></div>
 <div class="metric">Торможения<strong id="imuBrake">—</strong></div>
-<div class="metric">Коррекции<strong id="imuCorrections">—</strong></div>
+<div class="metric">Коррекции<strong id="imuCorrections">—</strong></div><div class="metric">Разброс пиков ускорения<strong id="imuStability">—</strong></div>
 </div>
 <p class="muted" id="imuQuality">Для анализа нужна синхронизация и достаточное число отсчётов.</p>
 <canvas id="imuGraph" style="width:100%;height:270px;background:#0c1729;border-radius:12px" width="850" height="270"></canvas>
@@ -222,7 +222,7 @@ async function updateImu(){
   const show=(id,v,unit)=>$(id).textContent=v===null||v===undefined?'—':Number(v).toFixed(1)+' '+unit;
   show('imuOnset',m.onset_ms,'мс');show('imuPeak',m.peak_a,'м/с²');
   show('imuGyro',m.peak_g,'°/с');show('imuJerk',m.peak_j,'м/с³');
-  show('imuBrake',m.brakes,'');show('imuCorrections',m.corrections,'');
+  show('imuBrake',m.brakes,'');show('imuCorrections',m.corrections,'');show('imuStability',m.stability_sd,'м/с²');
   $('imuQuality').textContent=trial.quality||'Нет данных';
   plotImu(trial.samples);
  }catch(e){$('imuLink').textContent='Ошибка IMU: '+e.message;}
