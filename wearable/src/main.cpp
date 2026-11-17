@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <Wire.h>
 
 // ESP32-C3 + MPU6050 at I2C 0x68; SDA GPIO4, SCL GPIO5.
