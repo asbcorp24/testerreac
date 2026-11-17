@@ -29,6 +29,17 @@ uint32_t cueUs = 0;
 uint32_t stageAtMs = 0;
 uint32_t eventSequence = 0;
 String lastEvent = "{\"seq\":0}";
+// Competition: all players complete identical target sequences in separate turns.
+bool competition = false;
+uint8_t playerCount = 0;
+uint8_t currentPlayer = 0;
+uint8_t roundCount = 0;
+uint8_t commonTargets[30] = {};
+struct Score { uint32_t sumMs = 0; uint16_t correct = 0; uint16_t errors = 0; };
+Score scores[4];
+String playerNames[4] = {"Игрок 1", "Игрок 2", "Игрок 3", "Игрок 4"};
+bool waitingForNextPlayer = false;
+
 
 void json(const String &s, int status = 200) {
     web.send(status, "application/json; charset=utf-8", s);
@@ -58,9 +69,11 @@ void scheduleNext() {
     if (completed >= goal) {
         stage = Stage::Idle;
         target = 0;
+        if (competition) waitingForNextPlayer = currentPlayer + 1 < playerCount;
         return;
     }
-    target = exercise == "single" ? fixedTarget :
+    if (competition) target = commonTargets[completed];
+    else target = exercise == "single" ? fixedTarget :
              exercise == "sequence" ? static_cast<uint8_t>((completed % 9) + 1) :
              static_cast<uint8_t>(random(1, 10));
     stageAtMs = millis() + static_cast<uint32_t>(
@@ -84,6 +97,14 @@ void finishTrial(uint8_t pressed, uint32_t pressUs, bool timedOut) {
     bool correct = !timedOut && pressed == expected;
     ++completed;
     ++eventSequence;
+    if (competition) {
+        if (correct) {
+            scores[currentPlayer].correct++;
+            scores[currentPlayer].sumMs += static_cast<uint32_t>(elapsed + 0.5f);
+        } else {
+            scores[currentPlayer].errors++;
+        }
+    }
 
     lastEvent = "{\"seq\":" + String(eventSequence) +
                 ",\"type\":\"" + (timedOut ? String("timeout") : String("press")) +
@@ -92,7 +113,8 @@ void finishTrial(uint8_t pressed, uint32_t pressUs, bool timedOut) {
                 ",\"correct\":" + (correct ? String("true") : String("false")) +
                 ",\"elapsed_ms\":" + String(elapsed, 2) +
                 ",\"completed\":" + String(completed) +
-                ",\"goal\":" + String(goal) + "}";
+                ",\"goal\":" + String(goal) +
+                ",\"player\":" + String(competition ? currentPlayer + 1 : 0) + "}";
     Serial.println(lastEvent);
     stage = Stage::Interval;
     stageAtMs = millis() + BETWEEN_TRIALS_MS;
@@ -145,7 +167,11 @@ void handleStatus() {
                   ",\"mode\":\"" + exercise + "\",\"source\":\"" + source +
                   "\",\"completed\":" + String(completed) +
                   ",\"goal\":" + String(goal) +
-                  ",\"event_seq\":" + String(eventSequence) + "}";
+                  ",\"event_seq\":" + String(eventSequence) +
+                  ",\"competition\":" + String(competition ? "true" : "false") +
+                  ",\"player\":" + String(competition ? currentPlayer + 1 : 0) +
+                  ",\"players\":" + String(playerCount) +
+                  ",\"awaiting_next\":" + String(waitingForNextPlayer ? "true" : "false") + "}";
     json(body);
 }
 
@@ -175,6 +201,9 @@ void handleStart() {
         json("{\"error\":\"Допустимо 1–100 заданий и кубы 1–9\"}", 400);
         return;
     }
+    competition = false;
+    waitingForNextPlayer = false;
+    playerCount = 0;
     exercise = requestedMode;
     source = requestedSource;
     fixedTarget = static_cast<uint8_t>(selected);
@@ -182,6 +211,78 @@ void handleStart() {
     completed = 0;
     scheduleNext();
     json("{\"ok\":true}");
+}
+
+void handleCompetitionStart() {
+    if (stage != Stage::Idle) {
+        json("{\"error\":\"Сначала остановите текущую серию\"}", 409);
+        return;
+    }
+    if (!allReleased()) {
+        json("{\"error\":\"Отпустите кнопки\"}", 409);
+        return;
+    }
+    int players = web.arg("players").toInt();
+    int rounds = web.arg("rounds").toInt();
+    String requestedSource = web.arg("source");
+    if (players < 1 || players > 4 || rounds < 1 || rounds > 30 ||
+        (requestedSource != "screen" && requestedSource != "audio")) {
+        json("{\"error\":\"Укажите 1–4 игроков, 1–30 заданий и источник сигнала\"}", 400);
+        return;
+    }
+    competition = true;
+    waitingForNextPlayer = false;
+    playerCount = static_cast<uint8_t>(players);
+    currentPlayer = 0;
+    roundCount = static_cast<uint8_t>(rounds);
+    source = requestedSource;
+    exercise = "competition";
+    for (uint8_t i = 0; i < 4; ++i) {
+        scores[i] = Score();
+        String name = web.arg("name" + String(i + 1));
+        name.trim();
+        // Names are not injected into JSON: the browser holds editable names.
+        playerNames[i] = name.length() ? name.substring(0, 24) : "Игрок " + String(i + 1);
+    }
+    for (uint8_t i = 0; i < roundCount; ++i) {
+        commonTargets[i] = static_cast<uint8_t>(random(1, 10));
+    }
+    completed = 0;
+    goal = roundCount;
+    scheduleNext();
+    json("{\"ok\":true}");
+}
+
+void handleCompetitionNext() {
+    if (!competition || !waitingForNextPlayer || stage != Stage::Idle ||
+        currentPlayer + 1 >= playerCount) {
+        json("{\"error\":\"Следующий участник пока недоступен\"}", 409);
+        return;
+    }
+    if (!allReleased()) {
+        json("{\"error\":\"Отпустите все кнопки\"}", 409);
+        return;
+    }
+    currentPlayer++;
+    completed = 0;
+    goal = roundCount;
+    waitingForNextPlayer = false;
+    scheduleNext();
+    json("{\"ok\":true}");
+}
+
+void handleCompetitionScores() {
+    String body = "{\"competition\":" + String(competition ? "true" : "false") +
+                  ",\"players\":" + String(playerCount) + ",\"scores\":[";
+    for (uint8_t i = 0; i < playerCount; ++i) {
+        if (i) body += ",";
+        body += "{\"player\":" + String(i + 1) +
+                ",\"correct\":" + String(scores[i].correct) +
+                ",\"errors\":" + String(scores[i].errors) +
+                ",\"sum_ms\":" + String(scores[i].sumMs) + "}";
+    }
+    body += "]}";
+    json(body);
 }
 
 void serveIndex() {
@@ -217,9 +318,14 @@ void setup() {
     web.on("/api/status", HTTP_GET, handleStatus);
     web.on("/api/event", HTTP_GET, []() { json(lastEvent); });
     web.on("/api/start", HTTP_POST, handleStart);
+    web.on("/api/competition/start", HTTP_POST, handleCompetitionStart);
+    web.on("/api/competition/next", HTTP_POST, handleCompetitionNext);
+    web.on("/api/competition/scores", HTTP_GET, handleCompetitionScores);
     web.on("/api/stop", HTTP_POST, []() {
         stage = Stage::Idle;
         target = 0;
+        competition = false;
+        waitingForNextPlayer = false;
         json("{\"ok\":true}");
     });
     web.begin();
