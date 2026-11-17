@@ -215,7 +215,7 @@ $('imuExport').onclick=()=>{
 async function updateImu(){
  try{
   const [state,trial]=await Promise.all([api('/api/imu'),api('/api/imu/trial')]);
-  $('imuLink').textContent=state.connected?'Датчик подключён · возраст пакета '+state.age_ms+' мс · потери '+state.lost+' · частота '+state.hz+' Гц':'Датчик не подключён';
+  $('imuLink').textContent=state.connected?'Датчик подключён · возраст пакета '+state.age_ms+' мс · потери '+state.lost+' · синхронизация '+(state.sync_valid?'да':'нет')+' · RTT '+state.sync_rtt_us+' мкс':'Датчик не подключён';
   if(trial.id===imuTrialId)return;
   imuTrialId=trial.id;imuLast=trial;
   const m=trial.metrics||{};
